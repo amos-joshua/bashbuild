@@ -164,6 +164,7 @@ class BashBuildApp(App):
     #right { width: 1fr; }
     #status { height: 1; background: $boost; color: $text; padding: 0 1; }
     #log { height: 1fr; padding: 0 1; background: $surface; }
+    #spinner { height: 1; padding: 0 1; background: $surface; color: $text-muted; }
     ConfirmScreen { align: center middle; }
     #confirm-box { width: 64; height: auto; border: thick $error; background: $surface; padding: 1 2; }
     #confirm-buttons { height: auto; align: center middle; padding-top: 1; }
@@ -205,6 +206,12 @@ class BashBuildApp(App):
         self._visible_targets: set[str] = set(self._all_targets)  # filter (all on)
         # state persists across tree rebuilds, keyed independent of node identity
         self._states: dict[tuple[str, str], str] = {}
+        # bottom-of-log activity line (spinner while a job streams)
+        self._spin_active = False
+        self._spin_label = ""
+        self._spin_start = 0.0
+        self._spin_frame = 0
+        self._spin_idle = "[dim]idle[/]"
 
     # ---- layout -----------------------------------------------------------
 
@@ -227,12 +234,15 @@ class BashBuildApp(App):
                     max_lines=20000,
                 )
                 yield self.out
+                self.spinner = Static(self._spin_idle, id="spinner")
+                yield self.spinner
         yield Footer()
 
     def on_mount(self) -> None:
         self.title = f"bashbuild · {self.manifest.name}"
         self.sub_title = str(self.root)
         self.set_interval(0.05, self._drain_pending)
+        self.set_interval(0.1, self._tick_spinner)
         self._build_tree()
         self._update_filter_bar()
         self.out.write(f"[bold cyan]workspace[/] {self.root}")
@@ -426,9 +436,15 @@ class BashBuildApp(App):
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(self.root),
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             limit=2**20,
+            # Detach from our controlling terminal: a build can spawn tools that
+            # would otherwise read our stdin or reconfigure the TTY (mouse mode,
+            # tcsetattr) and leave it wedged after exit. New session + no stdin =
+            # no access to the terminal at all.
+            start_new_session=True,
         )
         self.proc = proc
         assert proc.stdout is not None
@@ -492,8 +508,10 @@ class BashBuildApp(App):
             "bash",
             script.rel_to(self.root),
             cwd=str(self.root),
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
         )
         return await proc.wait() == 0
 
@@ -509,6 +527,8 @@ class BashBuildApp(App):
             self.notify("A job is already running", severity="warning")
             return
         self.busy = True
+        rc = -1
+        self._begin_spinner(f"{info.label} · {script.name}")
         try:
             self._set_state(node, info, RUNNING)
             rel = script.rel_to(self.root)
@@ -529,6 +549,42 @@ class BashBuildApp(App):
             )
         finally:
             self.busy = False
+            self._end_spinner(rc)
+
+    # ---- activity spinner (bottom line of the log pane) -------------------
+
+    _SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    @staticmethod
+    def _fmt_elapsed(seconds: float) -> str:
+        s = int(seconds)
+        return f"{s // 60}:{s % 60:02d}"
+
+    def _begin_spinner(self, label: str) -> None:
+        self._spin_active = True
+        self._spin_label = label
+        self._spin_start = monotonic()
+        self._spin_frame = 0
+
+    def _end_spinner(self, rc: int) -> None:
+        self._spin_active = False
+        elapsed = self._fmt_elapsed(monotonic() - self._spin_start)
+        mark = "[green]✓[/]" if rc == 0 else "[red]✗[/]"
+        self.spinner.update(
+            Text.from_markup(f"{mark} {self._spin_label} · done in {elapsed}")
+        )
+
+    def _tick_spinner(self) -> None:
+        if not self._spin_active:
+            return
+        self._spin_frame += 1
+        frame = self._SPIN[self._spin_frame % len(self._SPIN)]
+        elapsed = self._fmt_elapsed(monotonic() - self._spin_start)
+        self.spinner.update(
+            Text.from_markup(
+                f"[yellow]{frame}[/] {self._spin_label} · running  {elapsed}"
+            )
+        )
 
     # ---- actions ----------------------------------------------------------
 
