@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import os
+import signal
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import monotonic
 
+from rich.segment import Segment
+from rich.style import Style
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
+from textual.strip import Strip
 from textual.widgets import (
     Button,
     Footer,
@@ -63,6 +68,25 @@ class NodeInfo:
     consumes: list[str] | None = None  # component nodes: direct deps from manifest
     phase: int | None = None  # component nodes: 0-based phase index
     state_key: tuple[str, str] | None = None  # source/target: (component, "source"|triplet)
+
+
+# Keep per-script captured output bounded, mirroring the live pane's max_lines.
+_HISTORY_CAP = 20000
+
+
+@dataclass
+class ScriptRun:
+    """The captured output of one script execution, replayable into the pane."""
+
+    lines: list = field(default_factory=list)  # renderables in emit order
+    line_count: int = 0
+    rc: int | None = None  # None while still running
+    elapsed: float = 0.0
+
+
+def _count_lines(renderable) -> int:
+    text = renderable.plain if isinstance(renderable, Text) else str(renderable)
+    return text.count("\n") + 1
 
 
 def _rollup(target_states: list[str], source_state: str | None) -> str:
@@ -156,6 +180,66 @@ class FilterScreen(ModalScreen["set[str] | None"]):
         self.dismiss(None)
 
 
+class SelectableRichLog(RichLog):
+    """A RichLog that participates in Textual's mouse text selection.
+
+    RichLog renders pre-styled Strips and never bakes selection offsets into
+    them, so a plain (non-Shift) mouse drag has nothing to anchor to. We overlay
+    the selection style and call apply_offsets per visible line — mirroring how
+    the Log widget does it — and expose the line text via get_selection.
+    """
+
+    def render_line(self, y: int) -> Strip:
+        scroll_x, scroll_y = self.scroll_offset
+        line_index = scroll_y + y
+        width = self.scrollable_content_region.width
+        if line_index >= len(self.lines):
+            return Strip.blank(width, self.rich_style)
+
+        strip = self.lines[line_index]
+        selection = self.text_selection
+        if selection is not None and (span := selection.get_span(line_index)) is not None:
+            start, end = span
+            if end == -1:
+                end = strip.cell_length
+            strip = self._stylize_span(strip, start, end, self._selection_style())
+
+        strip = strip.crop_extend(scroll_x, scroll_x + width, self.rich_style)
+        strip = strip.apply_style(self.rich_style)
+        return strip.apply_offsets(scroll_x, line_index)
+
+    def _selection_style(self) -> Style:
+        """A background-only highlight: composite the theme's translucent
+        selection colour to opaque over the pane, leaving text foreground (and
+        thus readability) untouched."""
+        styles = self.screen.get_component_styles("screen--selection")
+        bg = self.background_colors[1] + styles.background
+        style = Style(bgcolor=bg.rich_color)
+        if styles.color.a:  # honour an explicit opaque selection foreground
+            style += Style(color=styles.color.rich_color)
+        return style
+
+    @staticmethod
+    def _stylize_span(strip: Strip, start: int, end: int, style: Style) -> Strip:
+        n = strip.cell_length
+        start = max(0, min(start, n))
+        end = max(0, min(end, n))
+        if end <= start:
+            return strip
+        left, middle, right = strip.divide([start, end, n])
+        # overlay (post_style) so the highlight wins over any cell background
+        # while each segment keeps its own foreground colour
+        highlighted = Strip(
+            list(Segment.apply_style(middle._segments, None, post_style=style)),
+            middle.cell_length,
+        )
+        return Strip.join([left, highlighted, right])
+
+    def get_selection(self, selection):
+        text = "\n".join(strip.text for strip in self.lines)
+        return selection.extract(text), "\n"
+
+
 class BashBuildApp(App):
     CSS = """
     #filterbar { height: 1; padding: 0 1; }
@@ -199,6 +283,11 @@ class BashBuildApp(App):
         self.proc: asyncio.subprocess.Process | None = None
         self._state_nodes: list[tuple[TreeNode, NodeInfo]] = []
         self._pending: list[str] = []  # streamed log lines awaiting render
+        # last-execution output per script, keyed by script path; the pane shows
+        # the captured run for whichever script the tree cursor is on.
+        self._runs: dict[Path, ScriptRun] = {}
+        self._capture: ScriptRun | None = None  # the in-progress run, if any
+        self._displayed: Path | None = None  # script whose output the pane shows
         # deduped, sorted aggregate of every target triplet across components
         self._all_targets: list[str] = sorted(
             {t.triplet for c in workspace.components for t in c.targets}
@@ -225,7 +314,7 @@ class BashBuildApp(App):
             with Vertical(id="right"):
                 self.status = Static("", id="status")
                 yield self.status
-                self.out = RichLog(
+                self.out = SelectableRichLog(
                     id="log",
                     markup=True,
                     highlight=False,
@@ -397,7 +486,39 @@ class BashBuildApp(App):
         self._relabel(comp_node)
 
     def on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
-        self._update_status(event.node.data)
+        info = event.node.data
+        self._update_status(info)
+        # While a job streams it owns the pane; otherwise browse the highlighted
+        # script's last-run output.
+        if not self.busy and info is not None and info.run_script is not None:
+            self._display_run(info.run_script)
+
+    def _display_run(self, script: Script) -> None:
+        if script.path == self._displayed:
+            return
+        self._displayed = script.path
+        self.out.clear()
+        run = self._runs.get(script.path)
+        if run is None or not run.lines:
+            self.out.write(
+                Text.from_markup(
+                    f"[dim]no output captured for {script.name} yet — "
+                    f"press r to run · c to check · d to delete[/]"
+                )
+            )
+            self.spinner.update(self._spin_idle)
+            return
+        for renderable in run.lines:
+            self.out.write(renderable)
+        self.out.scroll_home(animate=False)
+        if run.rc is not None:
+            mark = "[green]✓[/]" if run.rc == 0 else "[red]✗[/]"
+            self.spinner.update(
+                Text.from_markup(
+                    f"{mark} {script.name} · last run exit {run.rc} "
+                    f"· {self._fmt_elapsed(run.elapsed)}"
+                )
+            )
 
     def _update_status(self, info: NodeInfo | None) -> None:
         if info is None:
@@ -489,6 +610,17 @@ class BashBuildApp(App):
             del self._pending[:20000]
             self._pending.insert(0, "… [dropped 20000 lines to keep the UI responsive] …")
 
+    def _emit(self, renderable) -> None:
+        """Write to the live pane and, during a job, capture it for replay."""
+        self.out.write(renderable)
+        cap = self._capture
+        if cap is None:
+            return
+        cap.lines.append(renderable)
+        cap.line_count += _count_lines(renderable)
+        while cap.line_count > _HISTORY_CAP and len(cap.lines) > 1:
+            cap.line_count -= _count_lines(cap.lines.pop(0))
+
     def _drain_pending(self, limit: int = 300) -> None:
         """Render a bounded slice of buffered output — runs on a timer so the
         per-frame cost stays fixed regardless of how fast output arrives."""
@@ -496,7 +628,7 @@ class BashBuildApp(App):
             return
         take = self._pending[:limit]
         del self._pending[:limit]
-        self.out.write(Text.from_ansi("\n".join(take)))
+        self._emit(Text.from_ansi("\n".join(take)))
 
     async def _flush_pending(self) -> None:
         while self._pending:
@@ -528,11 +660,17 @@ class BashBuildApp(App):
             return
         self.busy = True
         rc = -1
+        # start a fresh capture for this script and show it live (replacing any
+        # previously displayed run); it becomes the script's saved last-run.
+        run = self._runs[script.path] = ScriptRun()
+        self._capture = run
+        self._displayed = script.path
+        self.out.clear()
         self._begin_spinner(f"{info.label} · {script.name}")
         try:
             self._set_state(node, info, RUNNING)
             rel = script.rel_to(self.root)
-            self.out.write(f"\n[bold cyan]$ bash {rel}[/]")
+            self._emit(f"[bold cyan]$ bash {rel}[/]")
             rc = await self._stream(["bash", rel])
             if interpret == "check":
                 self._set_state(node, info, PRESENT if rc == 0 else ABSENT)
@@ -544,10 +682,13 @@ class BashBuildApp(App):
                     self._set_state(node, info, PRESENT if ok else OK)
                 else:
                     self._set_state(node, info, OK if rc == 0 else FAILED)
-            self.out.write(
+            self._emit(
                 "[green]✓ exit 0[/]" if rc == 0 else f"[red]✗ exit {rc}[/]"
             )
         finally:
+            run.rc = rc
+            run.elapsed = monotonic() - self._spin_start
+            self._capture = None
             self.busy = False
             self._end_spinner(rc)
 
@@ -665,10 +806,14 @@ class BashBuildApp(App):
             self.notify("A job is already running", severity="warning")
             return
         self.busy = True
+        # group check isn't a single script's output; show it transiently and
+        # let the next navigation re-render a script's saved run.
+        self._displayed = None
+        self.out.clear()
         try:
             label = group_node.data.label
             self.out.write(
-                f"\n[bold cyan]checking {label} — {len(items)} target(s)…[/]"
+                f"[bold cyan]checking {label} — {len(items)} target(s)…[/]"
             )
             sem = asyncio.Semaphore(8)
 
@@ -704,11 +849,33 @@ class BashBuildApp(App):
             await self._run_job(node, info, info.delete_script, "delete")
 
     def action_kill(self) -> None:
-        if self.proc is not None and self.proc.returncode is None:
-            self.proc.terminate()
-            self.out.write("[yellow]⚠ job terminated[/]")
-        else:
+        proc = self.proc
+        if proc is None or proc.returncode is not None:
             self.notify("Nothing is running")
+            return
+        self._emit("[yellow]⚠ terminating job…[/]")
+        self.run_worker(self._terminate(proc), exclusive=False)
+
+    async def _terminate(self, proc: asyncio.subprocess.Process) -> None:
+        # The job runs in its own session (start_new_session=True), so signal the
+        # whole process group — not just bash — or its children keep running and
+        # hold the stdout pipe open, leaving _stream blocked on read.
+        try:
+            pgid = os.getpgid(proc.pid)
+        except ProcessLookupError:
+            return
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        for _ in range(30):  # give it ~3s to exit cleanly, then SIGKILL
+            if proc.returncode is not None:
+                return
+            await asyncio.sleep(0.1)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
     def action_clear_log(self) -> None:
         self.out.clear()

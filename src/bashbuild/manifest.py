@@ -67,6 +67,21 @@ def find_manifest(root: Path) -> Path | None:
     return None
 
 
+def resolve_workspace_root(root: Path) -> Path:
+    """Locate the directory holding the manifest, searching `root` then a
+    `build-workspace/` subdirectory. Raises ManifestError listing the absolute
+    paths searched if none is found."""
+    searched: list[Path] = []
+    for base in (root, root / "build-workspace"):
+        for name in MANIFEST_NAMES:
+            candidate = base / name
+            searched.append(candidate)
+            if candidate.is_file():
+                return base
+    paths = "\n".join(f"  {p}" for p in searched)
+    raise ManifestError(f"no build-workspace manifest found; looked in:\n{paths}")
+
+
 def load_manifest(root: Path, known_components: set[str]) -> Manifest:
     path = find_manifest(root)
     if path is None:

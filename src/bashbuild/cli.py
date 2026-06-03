@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 
 from .discovery import discover
-from .manifest import ManifestError, load_manifest
+from .manifest import ManifestError, load_manifest, resolve_workspace_root
 
 
 def main() -> int:
@@ -21,6 +21,12 @@ def main() -> int:
     root = args.workspace.expanduser().resolve()
     if not root.is_dir():
         print(f"error: {root} is not a directory", file=sys.stderr)
+        return 2
+
+    try:
+        root = resolve_workspace_root(root)
+    except ManifestError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
 
     try:
