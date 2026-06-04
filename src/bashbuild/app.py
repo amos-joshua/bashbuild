@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import codecs
 import os
+import shutil
 import signal
+import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -288,6 +290,11 @@ class BashBuildApp(App):
         self._runs: dict[Path, ScriptRun] = {}
         self._capture: ScriptRun | None = None  # the in-progress run, if any
         self._displayed: Path | None = None  # script whose output the pane shows
+        # debounce browsing: re-rendering a long captured log on every arrow key
+        # stalls fast navigation, so defer the render until the cursor settles.
+        self._pending_display: Script | None = None
+        self._display_timer = None
+        self._display_debounce = 1.0
         # deduped, sorted aggregate of every target triplet across components
         self._all_targets: list[str] = sorted(
             {t.triplet for c in workspace.components for t in c.targets}
@@ -491,7 +498,25 @@ class BashBuildApp(App):
         # While a job streams it owns the pane; otherwise browse the highlighted
         # script's last-run output.
         if not self.busy and info is not None and info.run_script is not None:
-            self._display_run(info.run_script)
+            self._schedule_display(info.run_script)
+
+    def _schedule_display(self, script: Script) -> None:
+        # Keep the current pane content visible while the cursor moves; only
+        # render once navigation has settled for _display_debounce seconds.
+        if self._display_timer is not None:
+            self._display_timer.stop()
+            self._display_timer = None
+        if script.path == self._displayed:
+            self._pending_display = None
+            return
+        self._pending_display = script
+        self._display_timer = self.set_timer(self._display_debounce, self._flush_display)
+
+    def _flush_display(self) -> None:
+        self._display_timer = None
+        script, self._pending_display = self._pending_display, None
+        if script is not None and not self.busy:
+            self._display_run(script)
 
     def _display_run(self, script: Script) -> None:
         if script.path == self._displayed:
@@ -659,6 +684,10 @@ class BashBuildApp(App):
             self.notify("A job is already running", severity="warning")
             return
         self.busy = True
+        if self._display_timer is not None:
+            self._display_timer.stop()
+            self._display_timer = None
+        self._pending_display = None
         rc = -1
         # start a fresh capture for this script and show it live (replacing any
         # previously displayed run); it becomes the script's saved last-run.
@@ -945,6 +974,31 @@ class BashBuildApp(App):
                 self.nav.move_cursor(n)
                 return
 
+    def _system_clipboard_copy(self, text: str) -> bool:
+        # OSC 52 (Textual's copy_to_clipboard) is silently dropped by terminals
+        # without clipboard-write support (e.g. qterminal/QTermWidget), so prefer
+        # a native helper and fall back to OSC 52 only when none is available.
+        cmds = {
+            "wl-copy": ["wl-copy"],
+            "xclip": ["xclip", "-selection", "clipboard"],
+            "xsel": ["xsel", "--clipboard", "--input"],
+            "pbcopy": ["pbcopy"],
+        }
+        order = (
+            ["wl-copy", "xclip", "xsel", "pbcopy"]
+            if os.environ.get("WAYLAND_DISPLAY")
+            else ["xclip", "xsel", "wl-copy", "pbcopy"]
+        )
+        for name in order:
+            if shutil.which(name) is None:
+                continue
+            try:
+                subprocess.run(cmds[name], input=text.encode(), check=True)
+                return True
+            except (OSError, subprocess.CalledProcessError):
+                continue
+        return False
+
     def action_copy_selection(self) -> None:
         # Textual captures the mouse, so native terminal selection is blocked —
         # drag over the log to make a Textual selection, then copy it here.
@@ -955,8 +1009,11 @@ class BashBuildApp(App):
                 severity="warning",
             )
             return
-        self.copy_to_clipboard(text)
-        self.notify(f"Copied {len(text)} chars to clipboard")
+        if self._system_clipboard_copy(text):
+            self.notify(f"Copied {len(text)} chars to clipboard")
+        else:
+            self.copy_to_clipboard(text)
+            self.notify(f"Copied {len(text)} chars (terminal OSC 52)")
 
     def action_save_log(self) -> None:
         text = "\n".join(strip.text for strip in self.out.lines)

@@ -17,7 +17,7 @@ are rejected at load time.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -39,11 +39,22 @@ class ManifestError(Exception):
 
 
 @dataclass
+class Secret:
+    """A secret bashbuild prompts for (hidden) before the TUI starts and, if
+    provided, injects into the environment so spawned scripts inherit it."""
+
+    env: str  # environment variable name to export
+    prompt: str  # human-facing prompt text
+    base64: bool = False  # if set, validate the input decodes as base64
+
+
+@dataclass
 class Manifest:
     name: str
     path: Path
     deps: dict[str, list[str]]  # component -> direct deps (all within the plan)
     phases: list[list[str]]  # topological levels of component names
+    secrets: list[Secret] = field(default_factory=list)
 
     @property
     def components(self) -> list[str]:
@@ -123,8 +134,39 @@ def load_manifest(root: Path, known_components: set[str]) -> Manifest:
                 raise ManifestError(f"{path}: '{comp}' depends on itself")
 
     phases = _topo_phases(deps, path)
+    secrets = _parse_secrets(data.get("secrets"), path)
     name = str(data.get("name") or root.name)
-    return Manifest(name=name, path=path, deps=deps, phases=phases)
+    return Manifest(name=name, path=path, deps=deps, phases=phases, secrets=secrets)
+
+
+def _parse_secrets(raw: object, path: Path) -> list[Secret]:
+    """Parse the optional 'secrets:' list. Each entry is either a bare env-var
+    name (string) or a mapping {env|name, prompt?, base64?}."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ManifestError(f"{path}: 'secrets:' must be a list")
+    out: list[Secret] = []
+    for item in raw:
+        if isinstance(item, str):
+            out.append(Secret(env=item, prompt=item))
+        elif isinstance(item, dict):
+            env = item.get("env") or item.get("name")
+            if not env:
+                raise ManifestError(f"{path}: each secret needs an 'env:' key")
+            env = str(env)
+            out.append(
+                Secret(
+                    env=env,
+                    prompt=str(item.get("prompt") or env),
+                    base64=bool(item.get("base64", False)),
+                )
+            )
+        else:
+            raise ManifestError(
+                f"{path}: secret entries must be a string or a mapping, got {type(item).__name__}"
+            )
+    return out
 
 
 def _topo_phases(deps: dict[str, list[str]], path: Path) -> list[list[str]]:

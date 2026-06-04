@@ -72,6 +72,29 @@ build:
 - Dangling references, self-deps, and cycles are rejected at load time with a
   clear message.
 
+### Secrets (optional)
+
+A workspace may declare secrets its scripts need (API keys, signing
+credentials). bashbuild prompts for them **once, hidden, before the TUI
+starts** — the only point input is possible, since scripts run with stdin
+detached — and injects any provided value into the environment, which every
+spawned script inherits. Nothing is written to disk.
+
+```yaml
+secrets:
+  - PLAY_SERVICE_ACCOUNT_B64                      # bare name: prompt == env var
+  - env: PLAY_SERVICE_ACCOUNT_B64                 # or a mapping:
+    prompt: Google Play service-account key (base64)
+    base64: true                                  # validate it decodes as base64
+```
+
+- **Press Enter to skip** any secret; a script that actually needs one fails
+  with its own message. Skipping is always allowed.
+- A value already set in the environment (e.g. exported beforehand) is kept and
+  not re-prompted.
+- `base64: true` rejects a value that doesn't decode, so a fat-fingered paste
+  fails at the prompt rather than mid-build.
+
 ## Keys
 
 | Key | Action |
